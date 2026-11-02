@@ -35,18 +35,10 @@ const CFG = {
   usageTable: 'Usage',
   usageResourceCol: 'Resource',
   usageMonthCol: 'YearMonth',
-  usageSessionsCol: 'Sessions',          // left blank on new rows (set to null to skip)
 
   resourcesTable: 'Resources',
-  resourceNameCol: 'ResourceName',               // column in Resources used for display in the preview
-
-  periodsTable: 'Periods',
-  periodStartCol: 'StartDate',
-  periodEndCol: 'EndDate',
-  periodSubscriptionCol: 'Subscription', // Reference column in Periods -> Subscriptions
-
-  subscriptionsTable: 'Subscriptions',
-  subscriptionResourcesCol: 'SubscriptionGroup', // Reference List (or Reference) column -> Resources
+  resourceNameCol: 'ResourceName',       // column in Resources used for display in the preview
+  resourceCollectCol: 'GristUsageCollect', // Toggle (boolean) column in Resources: true = add a row each month
 
   // Is Usage.Resource a Reference column to Resources (true) or plain text (false)?
   usageResourceIsReference: true,
@@ -84,50 +76,24 @@ function defaultMonthValue() {
   return t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0');
 }
 
-// Normalize a Reference / Reference List cell into an array of row ids.
-function refIds(v) {
-  if (Array.isArray(v)) return v[0] === 'L' ? v.slice(1) : v;
-  if (typeof v === 'number' && v > 0) return [v];
-  return [];
-}
-
-const isNum = v => typeof v === 'number' && isFinite(v);
-
 async function buildPlan(monthValue) {
   const { y, m } = parseMonthInput(monthValue);
   const monthStart = monthStartSecs(y, m);
-  const nextMonthStart = monthStartSecs(y, m + 1);
 
-  const [periods, subs, resources, usage] = await Promise.all([
-    grist.docApi.fetchTable(CFG.periodsTable),
-    grist.docApi.fetchTable(CFG.subscriptionsTable),
+  const [resources, usage] = await Promise.all([
     grist.docApi.fetchTable(CFG.resourcesTable),
     grist.docApi.fetchTable(CFG.usageTable),
   ]);
 
-  // 1. Subscriptions that have a period overlapping the target month
-  const activeSubIds = new Set();
-  periods.id.forEach((_, i) => {
-    const start = periods[CFG.periodStartCol][i];
-    const end = periods[CFG.periodEndCol][i];
-    if (!isNum(start)) return;                         // no start date: ignore
-    const startsBeforeMonthEnds = start < nextMonthStart;
-    const endsAfterMonthStarts = !isNum(end) || end >= monthStart;  // blank end = open-ended
-    if (startsBeforeMonthEnds && endsAfterMonthStarts) {
-      refIds(periods[CFG.periodSubscriptionCol][i]).forEach(id => activeSubIds.add(id));
-    }
-  });
-
-  // 2. Resources linked to those subscriptions
-  const activeResIds = new Set();
-  subs.id.forEach((subId, i) => {
-    if (!activeSubIds.has(subId)) return;
-    refIds(subs[CFG.subscriptionResourcesCol][i]).forEach(id => activeResIds.add(id));
-  });
-
-  // 3. Resources that already have a Usage row for this month
+  // 1. Resources flagged to collect usage (checkbox is true)
+  const collectIds = [];
   const resName = {};
-  resources.id.forEach((id, i) => { resName[id] = resources[CFG.resourceNameCol][i]; });
+  resources.id.forEach((id, i) => {
+    resName[id] = resources[CFG.resourceNameCol][i];
+    if (resources[CFG.resourceCollectCol][i] === true) collectIds.push(id);
+  });
+
+  // 2. Resources that already have a Usage row for this month
   const existing = new Set();
   usage.id.forEach((_, i) => {
     if (usage[CFG.usageMonthCol][i] !== monthStart) return;
@@ -136,13 +102,13 @@ async function buildPlan(monthValue) {
   });
 
   const toAdd = [];
-  activeResIds.forEach(id => {
+  collectIds.forEach(id => {
     const key = CFG.usageResourceIsReference ? id : String(resName[id]);
     if (!existing.has(key)) toAdd.push({ id, name: resName[id], key });
   });
   toAdd.sort((a, b) => String(a.name).localeCompare(String(b.name)));
 
-  return { monthValue, monthStart, activeCount: activeResIds.size, existingCount: existing.size, toAdd };
+  return { monthValue, monthStart, activeCount: collectIds.length, existingCount: existing.size, toAdd };
 }
 
 function renderPlan(p) {
@@ -150,9 +116,9 @@ function renderPlan(p) {
   list.innerHTML = '';
   p.toAdd.forEach(r => { const li = document.createElement('li'); li.textContent = r.name; list.appendChild(li); });
   if (p.toAdd.length) {
-    setStatus(`${p.monthValue}: ${p.activeCount} active resources, ${p.toAdd.length} rows to create.`);
+    setStatus(`${p.monthValue}: ${p.activeCount} resources flagged, ${p.toAdd.length} rows to create.`);
   } else {
-    setStatus(`${p.monthValue}: nothing to create (${p.activeCount} active resources, all already have rows).`);
+    setStatus(`${p.monthValue}: nothing to create (${p.activeCount} resources flagged, all already have rows).`);
   }
   $('createBtn').disabled = p.toAdd.length === 0;
 }
