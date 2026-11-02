@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Usage Row Generator</title>
+<script src="https://docs.getgrist.com/grist-plugin-api.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 10px; font-size: 14px; color: #222; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  button { padding: 6px 12px; border: 1px solid #16b378; background: #16b378; color: #fff;
+           border-radius: 4px; cursor: pointer; font-size: 14px; }
+  button.secondary { background: #fff; color: #16b378; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin: 6px 0; font-weight: 600; }
+  #status.err { color: #c0392b; }
+  ul { margin: 4px 0 0 18px; padding: 0; max-height: 180px; overflow: auto; }
+  .muted { color: #777; }
+</style>
+</head>
+<body>
+<div class="row">
+  <label for="month">Month:</label>
+  <input type="month" id="month">
+  <button class="secondary" id="previewBtn">Preview</button>
+  <button id="createBtn" disabled>Create missing rows</button>
+</div>
+<div id="status" class="muted">Starting…</div>
+<ul id="list"></ul>
+
+<script>
+/* ===================== CONFIGURATION — edit to match your document ===================== */
+const CFG = {
+  // Table and column names
+  usageTable: 'Usage',
+  usageResourceCol: 'Resource',
+  usageMonthCol: 'YearMonth',
+  usageSessionsCol: 'Sessions',          // left blank on new rows (set to null to skip)
+
+  resourcesTable: 'Resources',
+  resourceNameCol: 'ResourceName',               // column in Resources used for display in the preview
+
+  periodsTable: 'Periods',
+  periodStartCol: 'StartDate',
+  periodEndCol: 'EndDate',
+  periodSubscriptionCol: 'Subscription', // Reference column in Periods -> Subscriptions
+
+  subscriptionsTable: 'Subscriptions',
+  subscriptionResourcesCol: 'SubscriptionGroup', // Reference List (or Reference) column -> Resources
+
+  // Is Usage.Resource a Reference column to Resources (true) or plain text (false)?
+  usageResourceIsReference: true,
+
+  // Automatic mode: when the page containing this widget is opened, create any missing rows
+  // for the target month without clicking anything.
+  autoCreateOnOpen: true,
+
+  // Which month the widget targets by default (and in auto mode), relative to today:
+  //  0 = current month, -1 = previous month (if you record usage the month after it happens)
+  monthOffset: -1,
+};
+/* ======================================================================================== */
+
+const $ = id => document.getElementById(id);
+let plan = null;
+
+function setStatus(msg, isErr) {
+  const s = $('status');
+  s.textContent = msg;
+  s.className = isErr ? 'err' : '';
+}
+
+// Grist Date values arrive as seconds since the epoch (UTC midnight).
+function monthStartSecs(year, monthIndex) { return Date.UTC(year, monthIndex, 1) / 1000; }
+
+function parseMonthInput(v) {            // "2026-11" -> {y, m}
+  const [y, m] = v.split('-').map(Number);
+  return { y, m: m - 1 };
+}
+
+function defaultMonthValue() {
+  const d = new Date();
+  const t = new Date(d.getFullYear(), d.getMonth() + CFG.monthOffset, 1);
+  return t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0');
+}
+
+// Normalize a Reference / Reference List cell into an array of row ids.
+function refIds(v) {
+  if (Array.isArray(v)) return v[0] === 'L' ? v.slice(1) : v;
+  if (typeof v === 'number' && v > 0) return [v];
+  return [];
+}
+
+const isNum = v => typeof v === 'number' && isFinite(v);
+
+async function buildPlan(monthValue) {
+  const { y, m } = parseMonthInput(monthValue);
+  const monthStart = monthStartSecs(y, m);
+  const nextMonthStart = monthStartSecs(y, m + 1);
+
+  const [periods, subs, resources, usage] = await Promise.all([
+    grist.docApi.fetchTable(CFG.periodsTable),
+    grist.docApi.fetchTable(CFG.subscriptionsTable),
+    grist.docApi.fetchTable(CFG.resourcesTable),
+    grist.docApi.fetchTable(CFG.usageTable),
+  ]);
+
+  // 1. Subscriptions that have a period overlapping the target month
+  const activeSubIds = new Set();
+  periods.id.forEach((_, i) => {
+    const start = periods[CFG.periodStartCol][i];
+    const end = periods[CFG.periodEndCol][i];
+    if (!isNum(start)) return;                         // no start date: ignore
+    const startsBeforeMonthEnds = start < nextMonthStart;
+    const endsAfterMonthStarts = !isNum(end) || end >= monthStart;  // blank end = open-ended
+    if (startsBeforeMonthEnds && endsAfterMonthStarts) {
+      refIds(periods[CFG.periodSubscriptionCol][i]).forEach(id => activeSubIds.add(id));
+    }
+  });
+
+  // 2. Resources linked to those subscriptions
+  const activeResIds = new Set();
+  subs.id.forEach((subId, i) => {
+    if (!activeSubIds.has(subId)) return;
+    refIds(subs[CFG.subscriptionResourcesCol][i]).forEach(id => activeResIds.add(id));
+  });
+
+  // 3. Resources that already have a Usage row for this month
+  const resName = {};
+  resources.id.forEach((id, i) => { resName[id] = resources[CFG.resourceNameCol][i]; });
+  const existing = new Set();
+  usage.id.forEach((_, i) => {
+    if (usage[CFG.usageMonthCol][i] !== monthStart) return;
+    const r = usage[CFG.usageResourceCol][i];
+    existing.add(CFG.usageResourceIsReference ? r : String(r));
+  });
+
+  const toAdd = [];
+  activeResIds.forEach(id => {
+    const key = CFG.usageResourceIsReference ? id : String(resName[id]);
+    if (!existing.has(key)) toAdd.push({ id, name: resName[id], key });
+  });
+  toAdd.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+  return { monthValue, monthStart, activeCount: activeResIds.size, existingCount: existing.size, toAdd };
+}
+
+function renderPlan(p) {
+  const list = $('list');
+  list.innerHTML = '';
+  p.toAdd.forEach(r => { const li = document.createElement('li'); li.textContent = r.name; list.appendChild(li); });
+  if (p.toAdd.length) {
+    setStatus(`${p.monthValue}: ${p.activeCount} active resources, ${p.toAdd.length} rows to create.`);
+  } else {
+    setStatus(`${p.monthValue}: nothing to create (${p.activeCount} active resources, all already have rows).`);
+  }
+  $('createBtn').disabled = p.toAdd.length === 0;
+}
+
+async function createRows(p) {
+  if (!p.toAdd.length) return 0;
+  const cols = {
+    [CFG.usageResourceCol]: p.toAdd.map(r => CFG.usageResourceIsReference ? r.id : String(r.name)),
+    [CFG.usageMonthCol]: p.toAdd.map(() => p.monthStart),
+  };
+  await grist.docApi.applyUserActions([
+    ['BulkAddRecord', CFG.usageTable, p.toAdd.map(() => null), cols],
+  ]);
+  return p.toAdd.length;
+}
+
+async function preview() {
+  setStatus('Calculating…');
+  try { plan = await buildPlan($('month').value); renderPlan(plan); }
+  catch (e) { console.error(e); setStatus('Error: ' + (e.message || e), true); }
+}
+
+async function create() {
+  $('createBtn').disabled = true;
+  try {
+    // Recompute right before writing so we never create duplicates.
+    plan = await buildPlan($('month').value);
+    const n = await createRows(plan);
+    setStatus(`Created ${n} rows for ${plan.monthValue}.`);
+    $('list').innerHTML = '';
+  } catch (e) { console.error(e); setStatus('Error: ' + (e.message || e), true); }
+}
+
+grist.ready({ requiredAccess: 'full' });
+
+$('month').value = defaultMonthValue();
+$('previewBtn').onclick = preview;
+$('createBtn').onclick = create;
+
+(async function init() {
+  try {
+    plan = await buildPlan($('month').value);
+    if (CFG.autoCreateOnOpen && plan.toAdd.length) {
+      const n = await createRows(plan);
+      setStatus(`Auto-created ${n} rows for ${plan.monthValue}.`);
+    } else {
+      renderPlan(plan);
+    }
+  } catch (e) {
+    console.error(e);
+    setStatus('Error: ' + (e.message || e) + ' (check the CFG names at the top of the file)', true);
+  }
+})();
+</script>
+</body>
+</html>
